@@ -64,6 +64,7 @@ set(PYTHON_BINDINGS_LINK_LIBS
   MLIRCAPIExportSMTLIB
   MLIRCAPISCF
   MLIRCAPITarget
+  MLIRCAPIFunc
   # needed for mlirFrozenRewritePatternSetDestroy
   # but not the actual passes
   MLIRCAPITransforms
@@ -309,6 +310,14 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/emit.py
   DIALECT_NAME emit)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${MLIR_MAIN_SRC_DIR}/python/mlir"
+  TD_FILE dialects/FuncOps.td
+  SOURCES
+    dialects/func.py
+  DIALECT_NAME func)
 
 ################################################################################
 # Build composite binaries

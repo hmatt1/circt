@@ -37,6 +37,7 @@
 #include "circt-c/ExportLLVM.h"
 #include "circt-c/ExportVerilog.h"
 #include "mlir-c/Bindings/Python/Interop.h"
+#include "mlir-c/Dialect/Func.h"
 #include "mlir-c/Dialect/Index.h"
 #include "mlir-c/Dialect/LLVM.h"
 #include "mlir-c/Dialect/SCF.h"
@@ -130,6 +131,10 @@ NB_MODULE(_circt, m) {
         MlirDialectHandle scf = mlirGetDialectHandle__scf__();
         mlirDialectHandleRegisterDialect(scf, context);
         mlirDialectHandleLoadDialect(scf, context);
+
+        MlirDialectHandle func = mlirGetDialectHandle__func__();
+        mlirDialectHandleRegisterDialect(func, context);
+        mlirDialectHandleLoadDialect(func, context);
 
         MlirDialectHandle om = mlirGetDialectHandle__om__();
         mlirDialectHandleRegisterDialect(om, context);

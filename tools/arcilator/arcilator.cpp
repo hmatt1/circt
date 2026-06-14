@@ -65,6 +65,8 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -327,7 +329,116 @@ static void bindArcRuntimeSymbols(ExecutionEngine &executionEngine) {
     return symbolMap;
   });
 }
-#endif
+
+#ifdef _WIN32
+// On Windows the MSVC runtime does not provide the compiler-rt 128-bit integer
+// helper symbols (__divti3 et al.) that LLVM emits for i128 division/modulo.
+// The Win64 libcall ABI for these functions passes both operands by pointer
+// (RCX = &a, RDX = &b) and returns a <2 x i64> result in XMM0.  A plain
+// "define i128" shim does not match because llc applies sret/RAX:RDX lowering
+// to bare i128 returns.  The fix is two-part:
+//   1. Inject IR shims with signature "<2 x i64>(ptr, ptr)" into the module
+//      before JIT compilation via the transformer hook.
+//   2. Back each shim with a static C++ helper registered through registerSymbols,
+//      using a pointer-only interface that avoids any ABI issue.
+
+static void arcDivTI3Helper(void *res, const void *a, const void *b) {
+  uint64_t aw[2], bw[2];
+  memcpy(aw, a, 16);
+  memcpy(bw, b, 16);
+  auto r = llvm::APInt(128, llvm::ArrayRef<uint64_t>(aw, 2))
+               .sdiv(llvm::APInt(128, llvm::ArrayRef<uint64_t>(bw, 2)));
+  memcpy(res, r.getRawData(), 16);
+}
+
+static void arcUDivTI3Helper(void *res, const void *a, const void *b) {
+  uint64_t aw[2], bw[2];
+  memcpy(aw, a, 16);
+  memcpy(bw, b, 16);
+  auto r = llvm::APInt(128, llvm::ArrayRef<uint64_t>(aw, 2))
+               .udiv(llvm::APInt(128, llvm::ArrayRef<uint64_t>(bw, 2)));
+  memcpy(res, r.getRawData(), 16);
+}
+
+static void arcModTI3Helper(void *res, const void *a, const void *b) {
+  uint64_t aw[2], bw[2];
+  memcpy(aw, a, 16);
+  memcpy(bw, b, 16);
+  auto r = llvm::APInt(128, llvm::ArrayRef<uint64_t>(aw, 2))
+               .srem(llvm::APInt(128, llvm::ArrayRef<uint64_t>(bw, 2)));
+  memcpy(res, r.getRawData(), 16);
+}
+
+static void arcUModTI3Helper(void *res, const void *a, const void *b) {
+  uint64_t aw[2], bw[2];
+  memcpy(aw, a, 16);
+  memcpy(bw, b, 16);
+  auto r = llvm::APInt(128, llvm::ArrayRef<uint64_t>(aw, 2))
+               .urem(llvm::APInt(128, llvm::ArrayRef<uint64_t>(bw, 2)));
+  memcpy(res, r.getRawData(), 16);
+}
+
+// Inject <2 x i64>(ptr, ptr) shims for each 128-bit libcall into the module.
+// Each shim allocates a 16-byte result buffer, calls the corresponding C++
+// helper (registered separately via registerSymbols), loads the result as
+// <2 x i64>, and returns it — placing the value in XMM0 as the Win64 ABI
+// requires.  Using sdiv/udiv i128 inside the shim body is forbidden: LLVM
+// would re-legalize it back into a recursive __divti3 call.
+static void injectI128DivisionShims(llvm::Module &module) {
+  auto &ctx = module.getContext();
+  auto *voidTy = llvm::Type::getVoidTy(ctx);
+  auto *i8Ty = llvm::Type::getInt8Ty(ctx);
+  auto *i64Ty = llvm::Type::getInt64Ty(ctx);
+  auto *ptrTy = llvm::PointerType::getUnqual(ctx);
+  auto *vecTy = llvm::FixedVectorType::get(i64Ty, 2);
+  auto *shimFTy = llvm::FunctionType::get(vecTy, {ptrTy, ptrTy}, false);
+  auto *helperFTy =
+      llvm::FunctionType::get(voidTy, {ptrTy, ptrTy, ptrTy}, false);
+
+  const std::pair<StringRef, StringRef> ops[] = {
+      {"__divti3", "__arc_divti3_helper"},
+      {"__udivti3", "__arc_udivti3_helper"},
+      {"__modti3", "__arc_modti3_helper"},
+      {"__umodti3", "__arc_umodti3_helper"},
+  };
+
+  for (auto [shimName, helperName] : ops) {
+    auto *shim = llvm::cast<llvm::Function>(
+        module.getOrInsertFunction(shimName, shimFTy).getCallee());
+    if (!shim->empty())
+      continue;
+
+    auto helperCallee = module.getOrInsertFunction(helperName, helperFTy);
+    auto *bb = llvm::BasicBlock::Create(ctx, "entry", shim);
+    llvm::IRBuilder<> b(bb);
+
+    auto argIt = shim->arg_begin();
+    llvm::Value *pA = &*argIt++;
+    llvm::Value *pB = &*argIt;
+
+    auto *pR = b.CreateAlloca(llvm::ArrayType::get(i8Ty, 16), nullptr, "r");
+    llvm::cast<llvm::AllocaInst>(pR)->setAlignment(llvm::Align(16));
+    b.CreateCall(helperCallee, {pR, pA, pB});
+    b.CreateRet(b.CreateAlignedLoad(vecTy, pR, llvm::Align(16)));
+  }
+}
+
+static void bindI128DivisionHelpers(ExecutionEngine &engine) {
+  engine.registerSymbols([](llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap map;
+    bindExecutionEngineSymbol(map, interner, "__arc_divti3_helper",
+                              arcDivTI3Helper);
+    bindExecutionEngineSymbol(map, interner, "__arc_udivti3_helper",
+                              arcUDivTI3Helper);
+    bindExecutionEngineSymbol(map, interner, "__arc_modti3_helper",
+                              arcModTI3Helper);
+    bindExecutionEngineSymbol(map, interner, "__arc_umodti3_helper",
+                              arcUModTI3Helper);
+    return map;
+  });
+}
+#endif // _WIN32
+#endif // ARCILATOR_ENABLE_JIT
 
 /// Populate a pass manager with the arc simulator pipeline for the given
 /// command line options. This pipeline lowers modules to the Arc dialect.
@@ -530,6 +641,15 @@ static LogicalResult processBuffer(
         mlir::makeOptimizingTransformer(
             /*optLevel=*/3, /*sizeLevel=*/0,
             /*targetMachine=*/nullptr);
+#ifdef _WIN32
+    {
+      auto base = std::move(transformer);
+      transformer = [base = std::move(base)](llvm::Module *m) -> llvm::Error {
+        injectI128DivisionShims(*m);
+        return base(m);
+      };
+    }
+#endif
     engineOptions.transformer = transformer;
     engineOptions.sharedLibPaths = sharedLibraries;
 
@@ -547,6 +667,9 @@ static LogicalResult processBuffer(
 
     if (!noJitRuntime)
       bindArcRuntimeSymbols(**executionEngine);
+#ifdef _WIN32
+    bindI128DivisionHelpers(**executionEngine);
+#endif
 
     auto expectedFunc = (*executionEngine)->lookupPacked(jitEntryPoint);
     if (!expectedFunc) {
